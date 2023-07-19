@@ -1,122 +1,182 @@
+import math
 from time import sleep
-
+from datetime import date
 import pyvisa
 
 from pymeasure.instruments.keithley import Keithley2700
 
 
+def init_instrument(resource_manager, resource_name, write_termination='\n', read_termination='\n'):
+    instrument = resource_manager.open_resource(resource_name)
+    instrument.write_termination = write_termination
+    instrument.read_termination = read_termination
+    print(instrument.query('*IDN?'), '\n')
+    sleep(0.5)
+    instrument.write('*RST')
+    sleep(1)
+    return instrument
+
+
+def config_instrument_as_v_source_measure_i(instrument, voltage_range, voltage_level, i_compliance,
+                                            i_range, i_nplc):
+    instrument.write(":FORMat:ELEMents VOLTage, CURRent")
+    instrument.write(":SOURce:FUNCtion:MODE VOLTage")
+    instrument.write(":SOURce:VOLTage:MODE FIXed")
+    instrument.write(":SOURce:VOLTage:RANGe " + str(voltage_range))
+    instrument.write(":SOURce:VOLTage:LEVel " + str(voltage_level))
+    instrument.write(":SENSe:FUNCtion 'CURRent'")
+    instrument.write(":SENSe:CURRent:PROTection " + str(i_compliance))
+    instrument.write(":SENSe:CURRent:RANGe " + str(i_range))
+    instrument.write(":SENSe:CURRent:NPLCycles " + str(i_nplc))
+
+
+def config_instrument_as_dc_volmeter(instrument, voltmeter_channels, voltage_range, nplc=10,
+                                     a_zero=True):
+    instrument.write(':ROUTe:CHANnel:OPEN:ALL')
+    for voltmeter_channel in voltmeter_channels:
+        voltmeter_channel_str = '(@' + str(voltmeter_channel) + ')'
+        instrument.write(':SENS:FUNC "VOLTage:DC",' + str(voltmeter_channel_str))
+        instrument.write('SENS:VOLTage:DC:NPLC ' + str(nplc) + ',' + str(voltmeter_channel_str))
+        instrument.write(
+            'SENS:VOLTage:DC:RANGE ' + str(voltage_range) + ',' + str(voltmeter_channel_str))
+        if a_zero:
+            instrument.write('SENS:VOLTage:DC:AZER ON,' + str(voltmeter_channel_str))
+        else:
+            instrument.write('SENS:VOLTage:DC:AZER OFF,' + str(voltmeter_channel_str))
+
+
+def adjust_voltage_at_dut_gate(
+        source_meter, voltmeter, voltmeter_channel, desired_voltage_at_gate,
+        delay=0.5, max_source_meter_voltage=35.05, voltage_step=1E-3, max_delta_i=200E-6,
+        i_compliance=1E-3):
+    # Query voltage and current at the source_meter
+    query_resp = source_meter.query("READ?")
+    source_meter_voltage = float(query_resp.split(",")[0])
+    source_meter_initial_current = float(query_resp.split(",")[1])
+    if source_meter_initial_current > i_compliance:
+        raise "Source_Meter current is above the compliance....Exiting"
+    # Query voltage shunt at voltmeter channel
+    voltmeter_channel_str = '(@' + str(voltmeter_channel) + ')'
+    voltmeter.write(':ROUTe:CHANnel:CLOSe ' + voltmeter_channel_str)
+    voltage_at_shunt = float(voltmeter.query("READ?"))  # read measurement
+    voltage_at_gate = source_meter_voltage - voltage_at_shunt
+    # print("voltage_at_gate: ", voltage_at_gate)
+    # print("source_meter_voltage: ", source_meter_voltage)
+    # print("voltage_at_shunt: ", voltage_at_shunt)
+    new_source_meter_voltage = source_meter_voltage
+
+    while not math.isclose(desired_voltage_at_gate, voltage_at_gate, abs_tol=0.001):
+        # Adjust (increment) the source_meter voltage
+        new_source_meter_voltage = new_source_meter_voltage + voltage_step
+        source_meter.write(":SOURce:VOLTage:LEVel " + str(new_source_meter_voltage))
+        # Query voltage and current at the source_meter
+        query_resp = source_meter.query("READ?")
+        source_meter_voltage = float(query_resp.split(",")[0])
+        source_meter_current = float(query_resp.split(",")[1])
+        if source_meter_voltage > max_source_meter_voltage:
+            raise "Source_Meter Max voltage reached something went wrong....Exiting"
+        if source_meter_current > i_compliance:
+            raise "Source_Meter current is above the compliance....Exiting"
+        if (source_meter_current - source_meter_initial_current) > max_delta_i:
+            raise "Delta current is above the max delta....Exiting"
+        source_meter_initial_current = source_meter_current
+        # Query voltage shunt at voltmeter channel
+        voltmeter_channel_str = '(@' + str(voltmeter_channel) + ')'
+        voltmeter.write(':ROUTe:CHANnel:CLOSe ' + voltmeter_channel_str)
+        voltage_at_shunt = float(voltmeter.query("READ?"))  # read measurement
+        voltage_at_gate = source_meter_voltage - voltage_at_shunt
+        # print("voltage_at_gate: ", voltage_at_gate)
+        # print("source_meter_voltage: ", source_meter_voltage)
+        # print("voltage_at_shunt: ", voltage_at_shunt)
+        sleep(delay)
+
+
 def main():
-    # k6510 = Keithley2700("TCPIP0::169.254.199.70::inst0::INSTR",
-    #                      write_termination="\n",
-    #                      read_termination="\n")
-    # k6510.beep(1000, 1)
-
-    r_shunt = 1430.155  # Ohms
+    # Experiment data#########################################
     vcc = 35  # volts
-
+    experiment_date = date(2023, 7, 18)
+    t_amb = 25  # celsius
+    n_duts = 7
+    voltmeter_model = "DAQ6510_1"
+    multiplexer_card_model = "K7700_4"
+    source_meter_model = "K2400_4"
+    first_channel = 101
+    delay_between_measure_series = 1  # secs
+    delay_between_measure_devices = 0.0  # secs
+    delay_after_close_channel = 0.0  # secs
+    ##########################################################
+    duts_references = [''] * n_duts
+    r_shunts = [0] * n_duts  # Ohms
+    v_shunts = [0] * n_duts  # Volts
+    i_shunts = [0] * n_duts  # Amps
+    voltmeter_channels = [first_channel + n for n in range(n_duts)]
+    # Init duts_references####################################
+    duts_references_file_name = "duts_references.txt"
+    with open(duts_references_file_name, 'r') as file:
+        for i, r in enumerate(duts_references):
+            duts_references[i] = str(file.readline()).removesuffix('\n')
+    ##########################################################
+    # Init r_shunts_values####################################
+    r_shunts_file_name = "r_shunt_values.txt"
+    with open(r_shunts_file_name, 'r') as file:
+        for i, r in enumerate(r_shunts):
+            r_shunts[i] = float(file.readline())
+    ##########################################################
     rm = pyvisa.ResourceManager()
-
-    myDAQ6510 = rm.open_resource('TCPIP0::169.254.199.70::5025::SOCKET')
-    my2400 = rm.open_resource('GPIB0::24::INSTR')
-
-    myDAQ6510.write_termination = '\n'
-    myDAQ6510.read_termination = '\n'
-    my2400.write_termination = '\n'
-    my2400.read_termination = '\n'
-
-    print(myDAQ6510.query('*IDN?'))
-    myDAQ6510.write('*RST')
-    sleep(1)
-
-    print(my2400.query('*IDN?'))
-    my2400.write('*RST')
-    sleep(1)
-
-    current_at_2400 = float()
-    voltage_at_shunt = float()
-    current_at_shunt = float()
-    index = 1
-
-    # Config the 2400 for V-Source, Measure-I
-    my2400.write(":FORMat:ELEMents CURRent")
-    my2400.write(":SOURce:FUNCtion:MODE VOLTage")
-    my2400.write(":SOURce:VOLTage:MODE FIXed")
-    my2400.write(":SOURce:VOLTage:RANGe 200")
-    my2400.write(":SOURce:VOLTage:LEVel 35")
-    my2400.write(":SENSe:FUNCtion 'CURRent'")
-    my2400.write(":SENSe:CURRent:PROTection 10E-6")
-    my2400.write(":SENSe:CURRent:RANGe 10E-6")
-    my2400.write(":SENSe:CURRent:NPLCycles 10")
-    my2400.write(":OUTPut ON")
-
-    # Config the DAQ6510 for measuring voltage at channel 12
-    voltage_channel_12 = "(@112)"
-    myDAQ6510.write(':ROUTe:CHANnel:OPEN:ALL')
-    sleep(1)
-    myDAQ6510.write(':ROUTe:CHANnel:MULTiple:CLOSe ' + voltage_channel_12)
-    sleep(1.0)
-    myDAQ6510.write(':SENS:FUNC "VOLTage:DC",' + voltage_channel_12)
-    myDAQ6510.write('SENS:VOLTage:DC:NPLC 12,' + voltage_channel_12)
-    myDAQ6510.write('SENS:VOLTage:DC:RANGE 100E-3,' + voltage_channel_12)
-    myDAQ6510.write('SENS:VOLTage:DC:AZER OFF,' + voltage_channel_12)
-
-    # config file to write the test
+    # Init instruments########################################
+    daq6510 = init_instrument(rm, 'TCPIP0::169.254.199.70::5025::SOCKET', '\n', '\n')
+    k2400 = init_instrument(rm, 'ASRL5::INSTR', '\n', '\n')
+    ##########################################################
+    # Config the 2400 for V-Source, Measure-I#################
+    config_instrument_as_v_source_measure_i(k2400, 200, 35, 10E-6, 10E-6, 10)
+    ##########################################################
+    # Config the DAQ6510 for measuring voltage at channels##
+    config_instrument_as_dc_volmeter(daq6510, voltmeter_channels, 10E-3, nplc=12, a_zero=True)
+    ##########################################################
+    # config file to write the test###########################
+    index = 0
     file_name = "test1.txt"
     separator = ","
     with open(file_name, 'w') as file:
+        file.writelines("Test for simulating the i_leakage through a SiC Mosfet gate.\n")
         file.writelines(
-            "Test for simulating the i_leakage through a SiC Mosfet gate.\n")
-        file.writelines(
-            "Applied 35v to a series resistor circuit with 1430.155 Ohms shunt and a 10M resistor.\n")
-        file.writelines("index" + separator +
-                        "i_2400 (Amps)" + separator +
-                        "i_at_shunt (Amps)\n")
-
+            "Applied 35v to a series resistor circuit with 1430.155 Ohms shunt and a 10M "
+            "resistor.\n")
+        file.writelines("index" + separator)
+        for i, ref in enumerate(duts_references):
+            if i == (len(duts_references) - 1):
+                separator = ""
+            file.writelines("i@" + ref + "(Amps)" + separator)
+        file.writelines("\n")
+    ##########################################################
+    k2400.write(":OUTPut ON")
+    # Adjust voltage at gate##################################
+    adjust_voltage_at_dut_gate(k2400, daq6510, 101, 35)
+    ##########################################################
+    # MEASURE LOOP############################################
+    n_measure = 1
     while True:
-        voltage_at_shunt = float(myDAQ6510.query('READ?'))  # read measurement
-        current_at_shunt = voltage_at_shunt / r_shunt
-        current_at_2400 = my2400.query(':READ?')
-        print("current_at_2400: ", current_at_2400, " Amps")
-        print("current_at_shunt: ", current_at_shunt, " Amps")
-        sleep(1.0)
-        with open(file_name, 'a') as file:
-            file.writelines(str(index) + separator +
-                            str(current_at_2400) + separator +
-                            str(current_at_shunt) + "\n")
-        index = index + 1
-
-    # current_channel = "(@122)"
-    # voltage_channel_12 = "(@112)"
-    # voltage_channel_13 = "(@113)"
-    # voltage_channel_14 = "(@114)"
-    # voltage_channel_15 = "(@115)"
-    # voltage_channel_16 = "(@116)"
-    #
-    #
-    #
-    # myDAQ6510.write(':ROUTe:CHANnel:OPEN:ALL')
-    # sleep(1)
-    # myDAQ6510.write(':ROUTe:CHANnel:MULTiple:CLOSe ' + current_channel)
-    # sleep(1)
-    # myDAQ6510.write(':SENS:FUNC "CURRent:DC",' + current_channel)
-    # myDAQ6510.write('CURR:NPLC 10,' + current_channel)
-    # myDAQ6510.write('CURR:RANGE 1E-3,' + current_channel)
-    # myDAQ6510.write('CURR:AZER OFF,' + current_channel)
-    #
-    # current = float(myDAQ6510.query('READ?'))  # read measurement
-    # print(current)
-    # sleep(1)
-    #
-    #
-    # myDAQ6510.write(':ROUTe:CHANnel:MULTiple:CLOSe ' + voltage_channel_12)
-    # sleep(1.0)
-    # myDAQ6510.write(':SENS:FUNC "VOLTage:DC",' + voltage_channel_12)
-    # myDAQ6510.write('SENS:VOLTage:DC:NPLC 10,' + voltage_channel_12)
-    # myDAQ6510.write('SENS:VOLTage:DC:RANGE 1E+2,' + voltage_channel_12)
-    # myDAQ6510.write('SENS:VOLTage:DC:AZER OFF,' + voltage_channel_12)
-    # voltage = float(myDAQ6510.query('READ?'))  # read measurement
-    # print(voltage)
-    # sleep(1)
+        separator = ","
+        sleep(delay_between_measure_series)
+        for index, voltmeter_channel in enumerate(voltmeter_channels):
+            voltmeter_channel_str = '(@' + str(voltmeter_channel) + ')'
+            print(voltmeter_channel_str)
+            sleep(delay_between_measure_devices)
+            daq6510.write(':ROUTe:CHANnel:CLOSe ' + voltmeter_channel_str)
+            sleep(delay_after_close_channel)
+            voltage_at_shunt = float(daq6510.query("READ?"))  # read measurement
+            print(voltage_at_shunt)
+            current_at_shunt = voltage_at_shunt / r_shunts[index]
+            with open(file_name, 'a') as file:
+                if index == 0:
+                    file.writelines(str(n_measure) + separator)
+                if index == (len(voltmeter_channels) - 1):
+                    separator = "\n"
+                file.writelines(str(current_at_shunt) + separator)
+            sleep(delay_between_measure_devices)
+            # daq6510.write(':ROUTe:CHANnel:OPEN ' + voltmeter_channel_str)
+        n_measure = n_measure + 1
+    ##########################################################
 
 
 if __name__ == "__main__":
