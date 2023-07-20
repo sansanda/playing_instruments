@@ -1,9 +1,10 @@
 import math
 from time import sleep
-from datetime import date
-import pyvisa
+from datetime import date, datetime
 
-from pymeasure.instruments.keithley import Keithley2700
+import matplotlib.colors
+import matplotlib.pyplot as plt
+import pyvisa
 
 
 def init_instrument(resource_manager, resource_name, write_termination='\n', read_termination='\n'):
@@ -93,10 +94,11 @@ def adjust_voltage_at_dut_gate(
 
 def main():
     # Experiment data#########################################
+    output_data_file_name = "output1.txt"
     vcc = 35  # volts
-    experiment_date = date(2023, 7, 18)
+    experiment_date = datetime.now()
     t_amb = 25  # celsius
-    n_duts = 7
+    n_duts = 2  # max 10
     voltmeter_model = "DAQ6510_1"
     multiplexer_card_model = "K7700_4"
     source_meter_model = "K2400_4"
@@ -104,11 +106,12 @@ def main():
     delay_between_measure_series = 1  # secs
     delay_between_measure_devices = 0.0  # secs
     delay_after_close_channel = 0.0  # secs
+    plot_colors = ['red', 'green', 'blue', 'pink', 'brown', 'yellow', 'black', 'lime', 'violet', 'navy']
     ##########################################################
+    n_measure_series = list()
     duts_references = [''] * n_duts
     r_shunts = [0] * n_duts  # Ohms
-    v_shunts = [0] * n_duts  # Volts
-    i_shunts = [0] * n_duts  # Amps
+    current_at_shunts_evolution = [list() for i in range(n_duts)]  # Amps
     voltmeter_channels = [first_channel + n for n in range(n_duts)]
     # Init duts_references####################################
     duts_references_file_name = "duts_references.txt"
@@ -135,13 +138,20 @@ def main():
     ##########################################################
     # config file to write the test###########################
     index = 0
-    file_name = "test1.txt"
     separator = ","
-    with open(file_name, 'w') as file:
-        file.writelines("Test for simulating the i_leakage through a SiC Mosfet gate.\n")
-        file.writelines(
-            "Applied 35v to a series resistor circuit with 1430.155 Ohms shunt and a 10M "
-            "resistor.\n")
+    header = "I_leakage test through a SiC Mosfets gate.\n"
+    header += "Applied voltage: " + str(vcc) + "(V).\n"
+    header += "Experiment date: " + str(experiment_date) + "\n"
+    header += "Number of DUTS: " + str(n_duts) + ".\n"
+    header += "TAmb: " + str(t_amb) + " celsius.\n"
+    header += "Voltmeter model: " + voltmeter_model + ".\n"
+    header += "Multiplexer Card model: " + multiplexer_card_model + ".\n"
+    header += "Source Meter model: " + source_meter_model + ".\n"
+    header += "First channel: " + str(first_channel) + ".\n"
+
+    with open(output_data_file_name, 'w') as file:
+        file.writelines(header)
+        file.writelines("*" * 30 + "\n")
         file.writelines("index" + separator)
         for i, ref in enumerate(duts_references):
             if i == (len(duts_references) - 1):
@@ -153,6 +163,13 @@ def main():
     # Adjust voltage at gate##################################
     adjust_voltage_at_dut_gate(k2400, daq6510, 101, 35)
     ##########################################################
+    # Configure graph#########################################
+    plt.autoscale(enable=True, axis='y')
+    plt.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
+    plt.title("Mosfet leakage test over time")
+    plt.ylabel("Leakage Current in Amps")
+    plt.xlabel("Seconds")
+    ##########################################################
     # MEASURE LOOP############################################
     n_measure = 1
     while True:
@@ -160,22 +177,29 @@ def main():
         sleep(delay_between_measure_series)
         for index, voltmeter_channel in enumerate(voltmeter_channels):
             voltmeter_channel_str = '(@' + str(voltmeter_channel) + ')'
-            print(voltmeter_channel_str)
             sleep(delay_between_measure_devices)
             daq6510.write(':ROUTe:CHANnel:CLOSe ' + voltmeter_channel_str)
             sleep(delay_after_close_channel)
             voltage_at_shunt = float(daq6510.query("READ?"))  # read measurement
-            print(voltage_at_shunt)
             current_at_shunt = voltage_at_shunt / r_shunts[index]
-            with open(file_name, 'a') as file:
+            with open(output_data_file_name, 'a') as file:
                 if index == 0:
                     file.writelines(str(n_measure) + separator)
                 if index == (len(voltmeter_channels) - 1):
                     separator = "\n"
                 file.writelines(str(current_at_shunt) + separator)
+            current_at_shunts_evolution[index].append(current_at_shunt)
             sleep(delay_between_measure_devices)
             # daq6510.write(':ROUTe:CHANnel:OPEN ' + voltmeter_channel_str)
+        n_measure_series.append(n_measure)
         n_measure = n_measure + 1
+
+        # Update graph########################################
+        for i_color, currents in enumerate(current_at_shunts_evolution):
+            plt.plot(n_measure_series, currents, color=plot_colors[i_color])
+        plt.show(block=False)
+        plt.pause(0.1)
+        ######################################################
     ##########################################################
 
 

@@ -1,5 +1,0 @@
-Test for simulating the i_leakage through a SiC Mosfet gate.
-Applied 35v to a series resistor circuit with 1430.155 Ohms shunt and a 10M resistor.
-index,i@dut1(Amps),i@dut2(Amps),i@dut3(Amps),i@dut4(Amps),i@dut5(Amps),i@dut6(Amps),i@dut7(Amps)
-1,1.8728639969777106e-06,3.7283922720596538e+34,3.7189663527458363e+34,3.7338201128443407e+34,3.7335244093300395e+34,3.769317753486619e+34,3.761741192205976e+34
-2,1.8732183604080092e-06,3.7283922720596538e+34,3.7189663527458363e+34,
